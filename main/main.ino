@@ -3,13 +3,13 @@
 #include "DHTesp.h"
 #include <Wire.h>
 #include <driver/i2s.h>
-//#include "ens160.h"
 #include "ScioSense_ENS160.h"  // ENS160 library
+#include "PMS.h"
 
 // ——— WiFi/MQTT 설정 —————————————————————————
-const char* ssid = "Devop"; //WIFI name
-const char* password = "os7240485"; // WIFI password
-const char* mqtt_server = "13.125.235.68"; // ec2 server
+const char* ssid = "Devop"; //WIFI name, 
+const char* password = "os7240485"; // WIFI password,
+const char* mqtt_server = "13.125.235.68"; // ec2 server, 
 const int mqttPort = 1883;
 const char* mqttTopic = "sensors/data"; // publish topic
 
@@ -29,18 +29,18 @@ const i2s_port_t I2S_PORT = I2S_NUM_0;
 const int SAMPLE_COUNT = 1024;
 
 // ——— PMS5003 설정 (Serial2 사용) ————————————
-#define PMS_RX 16
-#define PMS_TX 17
-HardwareSerial SerialPMS(2);
+HardwareSerial SerialPMS(2);  // Serial2 사용 (GPIO16, GPIO17)
+PMS pms(SerialPMS);
+PMS::DATA data;
 
 // ——— ENS160 (TVOC) 설정 ——————————————————————
-ScioSense_ENS160 ens160(ENS160_I2CADDR_1);
+ScioSense_ENS160 ens160(ENS160_I2CADDR_1); //ADDRESS : 0X53
 
 // ——— 함수 선언 ————————————————————————————
 void setupWiFi();
 void reconnectMQTT();
 float readSoundLevel();
-bool readPMS(int &pm1, int &pm2_5, int &pm10);
+void readPMS(int &pm2_5, int &pm10);
 void readAndPublish();
 
 unsigned long lastMsg = 0;
@@ -79,7 +79,7 @@ void setup() {
   i2s_set_pin(I2S_PORT, &pin_config);
 
   // PMS5003 초기화
-  SerialPMS.begin(9600, SERIAL_8N1, PMS_RX, PMS_TX);
+  SerialPMS.begin(9600, SERIAL_8N1, 16, 17);
 
   // ENS160 초기화
   Wire.begin(21, 22); //SDA=21, SCL=22
@@ -95,14 +95,6 @@ void loop() {
     reconnectMQTT();
   }
   client.loop();
-  for (byte address = 1; address < 127; address++) {
-    Wire.beginTransmission(address);
-    byte error = Wire.endTransmission();
-    if (error == 0) {
-      Serial.print("✅ I2C device found at 0x");
-      Serial.println(address, HEX);
-    }
-  }
   readAndPublish();
   delay(5000); // 5초마다 전송
 }
@@ -142,6 +134,7 @@ void reconnectMQTT() {
 // 알려진 음원(예: 94dB @1kHz)으로 보정값 설정
 const float calibration_offset = 94.0;  // 실제 측정값으로 조정 필요
 
+// ——— 데시벨 읽기 ——————————————————————————
 float readSoundLevel() {
   const int32_t samples = SAMPLE_COUNT;
   int32_t buffer[samples];
@@ -179,12 +172,30 @@ float readSoundLevel() {
   return dbSPL;
 }
 
+// ——— PMS5003 읽기 ——————————————————————————
+void readPMS(uint16_t &pm2_5, uint16_t &pm10) {
+  unsigned long start = millis();
+  uint16_t timeout_ms = 1000;
+  while (millis() - start < timeout_ms) {
+    if(pms.read(data)){
+      pm2_5 = data.PM_AE_UG_2_5;
+      pm10 = data.PM_AE_UG_10_0;
+      return;
+    }
+  }
+  pm2_5 = 0;
+  pm10 = 0;
+}
+
 // ——— 센서 읽고 MQTT 발행 ————————————————————
 void readAndPublish() {
   // DHT22
   float temperature = dht.getTemperature();
   float humidity  = dht.getHumidity();
   float noise = readSoundLevel();
+
+  uint16_t pm25, pm10;
+  readPMS(pm25, pm10);
 
   ens160.measure();
   uint16_t tvoc = ens160.getTVOC();
@@ -196,8 +207,8 @@ void readAndPublish() {
     payload += "\"humidity\": " + String(humidity, 2) + ",";
     payload += "\"tvoc\": " + String(tvoc) + ", ";  // 예시값
     payload += "\"noise\": " + String(noise) + ","; // 예시값
-    payload += "\"pm10\": " + String(1.0, 2) + ",";   // 예시값
-    payload += "\"pm2_5\": " + String(0.5, 2);
+    payload += "\"pm10\": " + String(pm10) + ",";   // 예시값
+    payload += "\"pm2_5\": " + String(pm25);
     payload += "}";
 
     Serial.println("📤 MQTT 전송: ");
